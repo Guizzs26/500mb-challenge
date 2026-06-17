@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"math"
 	"net/http"
@@ -17,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const QueueBufferSize = 50000
 
 func main() {
 	if err := run(); err != nil {
@@ -34,6 +35,11 @@ func run() error {
 		return fmt.Errorf("initializing dependencies: %v", err)
 	}
 	defer deps.cleanup()
+
+	pgRepo := NewPgRepository(deps.pool)
+	for i := 0; i < 5; i++ {
+		go startWorker(deps.telemetryCh, pgRepo)
+	}
 
 	srv := &http.Server{
 		Addr:         ":8080",
@@ -75,8 +81,9 @@ func run() error {
 }
 
 type dependencies struct {
-	pool    *pgxpool.Pool
-	cleanup func()
+	pool        *pgxpool.Pool
+	telemetryCh chan TelemetryMessage
+	cleanup     func()
 }
 
 func initDependencies() (*dependencies, error) {
@@ -89,7 +96,8 @@ func initDependencies() (*dependencies, error) {
 	}
 
 	return &dependencies{
-		pool: pool,
+		pool:        pool,
+		telemetryCh: make(chan TelemetryMessage, QueueBufferSize),
 		cleanup: func() {
 			pool.Close()
 		},
@@ -100,7 +108,7 @@ func setupRoutes(deps *dependencies) http.Handler {
 	mux := http.NewServeMux()
 
 	pgRepo := NewPgRepository(deps.pool)
-	handler := NewHandler(pgRepo)
+	handler := NewHandler(deps, pgRepo)
 
 	mux.HandleFunc("POST /devices/{id}/telemetry", handler.createTelemetryPoint)
 
@@ -154,6 +162,18 @@ func setup(env, level string) {
 	slog.SetDefault(slog.New(handler))
 }
 
+func startWorker(ch <-chan TelemetryMessage, repo *pgRepository) {
+	for msg := range ch {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+		if err := repo.Save(ctx, msg.DeviceID, msg.Point); err != nil {
+			slog.Error("background save failed", "device_id", msg.DeviceID, "error", err)
+		}
+
+		cancel()
+	}
+}
+
 func InjectInstanceID(next http.Handler) http.Handler {
 	instanceID := os.Getenv("INSTANCE_ID")
 	if instanceID == "" {
@@ -174,6 +194,11 @@ type pgRepository struct {
 
 func NewPgRepository(p *pgxpool.Pool) *pgRepository {
 	return &pgRepository{pool: p}
+}
+
+type TelemetryMessage struct {
+	DeviceID string
+	Point    TelemetryPoint
 }
 
 type TelemetryPoint struct {
@@ -217,11 +242,15 @@ func (pr *pgRepository) Save(
 }
 
 type handler struct {
+	deps *dependencies
 	repo TelemetryRepository
 }
 
-func NewHandler(repo TelemetryRepository) *handler {
-	return &handler{repo: repo}
+func NewHandler(deps *dependencies, repo TelemetryRepository) *handler {
+	return &handler{
+		deps: deps,
+		repo: repo,
+	}
 }
 
 type TelemetryRequest struct {
@@ -281,9 +310,6 @@ func (tr TelemetryRequest) Validate() error {
 }
 
 func (h *handler) createTelemetryPoint(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
 	deviceID := r.PathValue("id")
 	if !idRegex.MatchString(deviceID) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
@@ -301,21 +327,24 @@ func (h *handler) createTelemetryPoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tp := TelemetryPoint{
-		Ts:      *req.Ts,
-		Lat:     *req.Lat,
-		Lon:     *req.Lon,
-		Battery: req.Battery,
-		Ax:      *req.Ax,
-		Ay:      *req.Ay,
-		Az:      *req.Az,
+	msg := TelemetryMessage{
+		DeviceID: deviceID,
+		Point: TelemetryPoint{
+			Ts:      *req.Ts,
+			Lat:     *req.Lat,
+			Lon:     *req.Lon,
+			Battery: req.Battery,
+			Ax:      *req.Ax,
+			Ay:      *req.Ay,
+			Az:      *req.Az,
+		},
 	}
 
-	if err := h.repo.Save(ctx, deviceID, tp); err != nil {
-		log.Println("database error", err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
+	select {
+	case h.deps.telemetryCh <- msg:
+		w.WriteHeader(http.StatusAccepted)
+	default:
+		slog.Warn("backpressure activated, queue is full", "queue_size", QueueBufferSize)
+		http.Error(w, "service unavailable, queue full", http.StatusServiceUnavailable)
 	}
-
-	w.WriteHeader(http.StatusAccepted)
 }
