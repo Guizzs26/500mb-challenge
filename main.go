@@ -104,11 +104,11 @@ func setupRoutes(deps *dependencies) http.Handler {
 
 	mux.HandleFunc("POST /devices/{id}/telemetry", handler.createTelemetryPoint)
 
-	return mux
+	return InjectInstanceID(mux)
 }
 
 func newPostgresPool(ctx context.Context) (*pgxpool.Pool, error) {
-	poolCfg, err := pgxpool.ParseConfig("postgres://postgres500user:postgres500pass@localhost:5432/postgres500db?sslmode=disable")
+	poolCfg, err := pgxpool.ParseConfig("postgres://postgres500user:postgres500pass@postgres:5432/postgres500db?sslmode=disable")
 	if err != nil {
 		return nil, fmt.Errorf("parse connection string: %v", err)
 	}
@@ -152,6 +152,18 @@ func setup(env, level string) {
 	}
 
 	slog.SetDefault(slog.New(handler))
+}
+
+func InjectInstanceID(next http.Handler) http.Handler {
+	instanceID := os.Getenv("INSTANCE_ID")
+	if instanceID == "" {
+		instanceID = "local-dev"
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Instance-Id", instanceID)
+		next.ServeHTTP(w, r)
+	})
 }
 
 var idRegex = regexp.MustCompile("^[a-zA-Z0-9_-]{1,64}$")
