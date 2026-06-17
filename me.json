@@ -1,9 +1,0 @@
-{
-  "collaborators": [
-    {
-      "name": "guizzs26",
-      "social_links": ["https://github.com/guizzs26", "https://www.linkedin.com/in/guilherme-alexandre-teixeira/"]
-    }
-  ],
-  "stack": ["go", "postgres", "nginx"]
-}
