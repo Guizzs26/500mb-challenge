@@ -24,7 +24,7 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stdout, "application failed %v\n", err)
+		fmt.Fprintf(os.Stderr, "application failed %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -183,13 +183,13 @@ func startWorker(ch <-chan TelemetryMessage, repo *pgRepository) {
 			grouped[msg.DeviceID] = append(grouped[msg.DeviceID], msg.Point)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		for deviceID, points := range grouped {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if _, err := repo.SaveBatch(ctx, deviceID, points); err != nil {
 				slog.Error("failed to flush micro-bash to postgres", "error", err)
 			}
+			cancel()
 		}
-		cancel()
 
 		buff = buff[:0]
 	}
@@ -256,34 +256,7 @@ type TelemetryPoint struct {
 }
 
 type TelemetryRepository interface {
-	Save(ctx context.Context, deviceID string, tp TelemetryPoint) error
 	SaveBatch(ctx context.Context, deviceID string, points []TelemetryPoint) (int, error)
-}
-
-func (pr *pgRepository) Save(
-	ctx context.Context,
-	deviceID string,
-	tp TelemetryPoint,
-) error {
-	const query = `
-		INSERT INTO device_telemetries (device_id, ts, lat, lon, battery, ax, ay, az) 
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
-	`
-
-	if _, err := pr.pool.Exec(ctx, query,
-		deviceID,
-		tp.Ts,
-		tp.Lat,
-		tp.Lon,
-		tp.Battery,
-		tp.Ax,
-		tp.Ay,
-		tp.Az,
-	); err != nil {
-		return fmt.Errorf("save telemetry: %v", err)
-	}
-
-	return nil
 }
 
 func (pr *pgRepository) SaveBatch(
