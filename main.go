@@ -167,14 +167,49 @@ func setup(env, level string) {
 }
 
 func startWorker(ch <-chan TelemetryMessage, repo *pgRepository) {
-	for msg := range ch {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 
-		if err := repo.Save(ctx, msg.DeviceID, msg.Point); err != nil {
-			slog.Error("background save failed", "device_id", msg.DeviceID, "error", err)
+	maxBatchSize := 200
+	buff := make([]TelemetryMessage, 0, maxBatchSize)
+
+	flush := func() {
+		if len(buff) == 0 {
+			return
 		}
 
+		grouped := make(map[string][]TelemetryPoint)
+		for _, msg := range buff {
+			grouped[msg.DeviceID] = append(grouped[msg.DeviceID], msg.Point)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for deviceID, points := range grouped {
+			if _, err := repo.SaveBatch(ctx, deviceID, points); err != nil {
+				slog.Error("failed to flush micro-bash to postgres", "error", err)
+			}
+		}
 		cancel()
+
+		buff = buff[:0]
+	}
+
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buff = append(buff, msg)
+
+			if len(buff) >= maxBatchSize {
+				flush()
+			}
+
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 
