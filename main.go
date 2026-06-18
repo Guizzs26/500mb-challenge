@@ -11,13 +11,16 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const QueueBufferSize = 50000
+const (
+	QueueBufferSize = 50000
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -111,6 +114,7 @@ func setupRoutes(deps *dependencies) http.Handler {
 	handler := NewHandler(deps, pgRepo)
 
 	mux.HandleFunc("POST /devices/{id}/telemetry", handler.createTelemetryPoint)
+	mux.HandleFunc("POST /devices/{id}/telemetry/batch", handler.createTelemetryPointBatch)
 
 	return InjectInstanceID(mux)
 }
@@ -163,14 +167,49 @@ func setup(env, level string) {
 }
 
 func startWorker(ch <-chan TelemetryMessage, repo *pgRepository) {
-	for msg := range ch {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 
-		if err := repo.Save(ctx, msg.DeviceID, msg.Point); err != nil {
-			slog.Error("background save failed", "device_id", msg.DeviceID, "error", err)
+	maxBatchSize := 200
+	buff := make([]TelemetryMessage, 0, maxBatchSize)
+
+	flush := func() {
+		if len(buff) == 0 {
+			return
 		}
 
+		grouped := make(map[string][]TelemetryPoint)
+		for _, msg := range buff {
+			grouped[msg.DeviceID] = append(grouped[msg.DeviceID], msg.Point)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for deviceID, points := range grouped {
+			if _, err := repo.SaveBatch(ctx, deviceID, points); err != nil {
+				slog.Error("failed to flush micro-bash to postgres", "error", err)
+			}
+		}
 		cancel()
+
+		buff = buff[:0]
+	}
+
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buff = append(buff, msg)
+
+			if len(buff) >= maxBatchSize {
+				flush()
+			}
+
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 
@@ -201,6 +240,11 @@ type TelemetryMessage struct {
 	Point    TelemetryPoint
 }
 
+type TelemetryBatchMessage struct {
+	DeviceID string
+	Points   []TelemetryPoint
+}
+
 type TelemetryPoint struct {
 	Ts      int64
 	Lat     float64
@@ -213,6 +257,7 @@ type TelemetryPoint struct {
 
 type TelemetryRepository interface {
 	Save(ctx context.Context, deviceID string, tp TelemetryPoint) error
+	SaveBatch(ctx context.Context, deviceID string, points []TelemetryPoint) (int, error)
 }
 
 func (pr *pgRepository) Save(
@@ -239,6 +284,35 @@ func (pr *pgRepository) Save(
 	}
 
 	return nil
+}
+
+func (pr *pgRepository) SaveBatch(
+	ctx context.Context,
+	deviceID string,
+	points []TelemetryPoint,
+) (int, error) {
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO device_telemetries (device_id, ts, lat, lon, battery, ax, ay, az) VALUES ")
+
+	args := make([]any, 0, len(points)*8)
+	for i, tp := range points {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+
+		base := i * 8
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
+
+		args = append(args, deviceID, tp.Ts, tp.Lat, tp.Lon, tp.Battery, tp.Ax, tp.Ay, tp.Az)
+	}
+
+	tag, err := pr.pool.Exec(ctx, sb.String(), args...)
+	if err != nil {
+		return 0, fmt.Errorf("exec batch insert: %v", err)
+	}
+
+	return int(tag.RowsAffected()), nil
 }
 
 type handler struct {
@@ -278,7 +352,7 @@ func (tr TelemetryRequest) Validate() error {
 
 	if tr.Lon == nil {
 		return errors.New("longitude field is required")
-	} else if *tr.Lat < -180 || *tr.Lat > 180 {
+	} else if *tr.Lon < -180 || *tr.Lon > 180 {
 		return errors.New("longitute must be whitin -180 and 180 interval")
 	}
 
@@ -304,6 +378,28 @@ func (tr TelemetryRequest) Validate() error {
 		return errors.New("az field is required")
 	} else if math.IsNaN(*tr.Az) || math.IsInf(*tr.Az, 0) {
 		return errors.New("az field must be a finite number")
+	}
+
+	return nil
+}
+
+type TelemetryBatchRequest struct {
+	Points []TelemetryRequest `json:"points"`
+}
+
+func (tbr TelemetryBatchRequest) Validate() error {
+	totalPoints := len(tbr.Points)
+	if totalPoints == 0 {
+		return errors.New("points array cannot be empty")
+	}
+	if totalPoints > 100 {
+		return errors.New("batch max capacity exceeded (limit is 100 points)")
+	}
+
+	for i, req := range tbr.Points {
+		if err := req.Validate(); err != nil {
+			return fmt.Errorf("invalid point at index %d: %v", i, err)
+		}
 	}
 
 	return nil
@@ -347,4 +443,50 @@ func (h *handler) createTelemetryPoint(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("backpressure activated, queue is full", "queue_size", QueueBufferSize)
 		http.Error(w, "service unavailable, queue full", http.StatusServiceUnavailable)
 	}
+}
+
+func (h *handler) createTelemetryPointBatch(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	deviceID := r.PathValue("id")
+	if !idRegex.MatchString(deviceID) {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	var req TelemetryBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	points := make([]TelemetryPoint, len(req.Points))
+	for i, p := range req.Points {
+		points[i] = TelemetryPoint{
+			Ts:      *p.Ts,
+			Lat:     *p.Lat,
+			Lon:     *p.Lon,
+			Battery: p.Battery,
+			Ax:      *p.Ax,
+			Ay:      *p.Ay,
+			Az:      *p.Az,
+		}
+	}
+
+	acceptedCount, err := h.repo.SaveBatch(ctx, deviceID, points)
+	if err != nil {
+		slog.Error("database batch error", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]int{"accepted": acceptedCount})
 }
