@@ -30,6 +30,7 @@ services:
         -c max_connections=50
         -c checkpoint_completion_target=0.9
         -c wal_buffers=8MB
+        -c synchronous_commit=off
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres500user -d postgres500db"]
       interval: 5s

@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS device_telemetries (
+CREATE UNLOGGED TABLE IF NOT EXISTS device_telemetries (
     id BIGSERIAL,
     device_id VARCHAR(64) NOT NULL,
     ts BIGINT NOT NULL,
@@ -9,3 +9,5 @@ CREATE TABLE IF NOT EXISTS device_telemetries (
     ay DOUBLE PRECISION NOT NULL,
     az DOUBLE PRECISION NOT NULL
 );
+
+CREATE INDEX idx_device_ts ON device_telemetries (device_id, ts DESC);
